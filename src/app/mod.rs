@@ -31,6 +31,7 @@ struct Config {
     name: String,
     hostname: String,
     broker_builder: Box<dyn BrokerBuilder>,
+    broker_override: Option<Box<dyn Broker>>,
     broker_connection_timeout: u32,
     broker_connection_retry: bool,
     broker_connection_max_retries: u32,
@@ -60,6 +61,7 @@ impl CeleryBuilder {
                         .unwrap_or_else(|| "unknown".into())
                 ),
                 broker_builder: broker_builder_from_url(broker_url),
+                broker_override: None,
                 broker_connection_timeout: 2,
                 broker_connection_retry: true,
                 broker_connection_max_retries: 5,
@@ -69,6 +71,12 @@ impl CeleryBuilder {
                 task_routes: vec![],
             },
         }
+    }
+
+    /// Provide a fully constructed broker to use instead of building/connecting via URL.
+    pub fn with_broker(mut self, broker: Box<dyn Broker>) -> Self {
+        self.config.broker_override = Some(broker);
+        self
     }
 
     /// Set the node name of the app. Defaults to `"{name}@{sys hostname}"`.
@@ -191,6 +199,27 @@ impl CeleryBuilder {
 
     /// Construct a [`Celery`] app with the current configuration.
     pub async fn build(self) -> Result<Celery, CeleryError> {
+        if let Some(broker) = self.config.broker_override {
+            let mut task_routes = Vec::with_capacity(self.config.task_routes.len());
+            for (pattern, queue) in &self.config.task_routes {
+                task_routes.push(Rule::new(pattern, queue).map_err(BrokerError::from)?);
+            }
+
+            return Ok(Celery {
+                name: self.config.name,
+                hostname: self.config.hostname,
+                broker,
+                default_queue: self.config.default_queue,
+                task_options: self.config.task_options,
+                task_routes,
+                task_trace_builders: RwLock::new(HashMap::new()),
+                broker_connection_timeout: self.config.broker_connection_timeout,
+                broker_connection_retry: self.config.broker_connection_retry,
+                broker_connection_max_retries: self.config.broker_connection_max_retries,
+                broker_connection_retry_delay: self.config.broker_connection_retry_delay,
+            });
+        }
+
         // Declare default queue to broker.
         let broker_builder = self
             .config

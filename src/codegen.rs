@@ -38,6 +38,43 @@ macro_rules! __app_internal {
 
 #[doc(hidden)]
 #[macro_export]
+macro_rules! __app_internal_broker_override {
+    (
+        { $broker:expr },
+        [ $( $t:ty ),* ],
+        [ $( $pattern:expr => $queue:expr ),* ],
+        $( $x:ident = $y:expr, )*
+    ) => {{
+        async fn _build_app(mut builder: $crate::CeleryBuilder) ->
+            $crate::export::Result<$crate::export::Arc<$crate::Celery>> {
+            let celery: $crate::Celery = builder.build().await?;
+
+            $(
+                celery.register_task::<$t>().await?;
+            )*
+
+            Ok($crate::export::Arc::new(celery))
+        }
+
+        // NOTE: The URL is a placeholder only. When `with_broker` is used, build()
+        // must not attempt to connect using this URL.
+        let mut builder = $crate::CeleryBuilder::new("celery", "redis://localhost/0")
+            .with_broker($broker);
+
+        $(
+            builder = builder.$x($y);
+        )*
+
+        $(
+            builder = builder.task_route($pattern, $queue);
+        )*
+
+        _build_app(builder)
+    }};
+}
+
+#[doc(hidden)]
+#[macro_export]
 macro_rules! __beat_internal {
     (
         $broker_type:ty { $broker_url:expr },
@@ -158,6 +195,19 @@ macro_rules! app {
     ) => {
         $crate::__app_internal!(
             $broker_type { $broker_url },
+            [ $( $t ),* ],
+            [ $( $pattern => $queue ),* ],
+            $( $x = $y, )*
+        );
+    };
+    (
+        broker = { $broker:expr },
+        tasks = [ $( $t:ty ),* $(,)? ],
+        task_routes = [ $( $pattern:expr => $queue:expr ),* $(,)? ]
+        $(, $x:ident = $y:expr )* $(,)?
+    ) => {
+        $crate::__app_internal_broker_override!(
+            { $broker },
             [ $( $t ),* ],
             [ $( $pattern => $queue ),* ],
             $( $x = $y, )*
