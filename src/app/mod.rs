@@ -10,7 +10,7 @@ use tokio::select;
 #[cfg(unix)]
 use tokio::signal::unix::{signal, Signal, SignalKind};
 
-use tokio::sync::mpsc::{self, UnboundedSender};
+use tokio::sync::mpsc;
 use tokio::sync::RwLock;
 use tokio::time::{self, Duration};
 use tokio_stream::StreamMap;
@@ -24,7 +24,7 @@ use crate::broker::{
 use crate::error::{BrokerError, CeleryError, TraceError};
 use crate::protocol::{Message, MessageContentType};
 use crate::routing::Rule;
-use crate::task::{AsyncResult, Signature, Task, TaskEvent, TaskOptions, TaskStatus};
+use crate::task::{AsyncResult, Signature, Task, TaskOptions};
 use trace::{build_tracer, TraceBuilder, TracerTrait};
 
 struct Config {
@@ -363,7 +363,6 @@ impl Celery {
     async fn get_task_tracer(
         self: &Arc<Self>,
         message: Message,
-        event_tx: UnboundedSender<TaskEvent>,
     ) -> Result<Box<dyn TracerTrait>, Box<dyn Error + Send + Sync + 'static>> {
         let task_trace_builders = self.task_trace_builders.read().await;
         if let Some(build_tracer) = task_trace_builders.get(&message.headers.task) {
@@ -371,7 +370,6 @@ impl Celery {
                 self.clone(),
                 message,
                 self.task_options,
-                event_tx,
                 self.hostname.clone(),
             )
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync + 'static>)?)
@@ -388,7 +386,6 @@ impl Celery {
     async fn try_handle_delivery(
         self: &Arc<Self>,
         delivery: Box<dyn Delivery>,
-        event_tx: UnboundedSender<TaskEvent>,
     ) -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
         // Coerce the delivery into a protocol message.
         let message = match delivery.try_deserialize_message() {
@@ -407,7 +404,7 @@ impl Celery {
         // Try deserializing the message to create a task wrapped in a task tracer.
         // (The tracer handles all of the logic of directly interacting with the task
         // to execute it and run the post-execution functions).
-        let mut tracer = match self.get_task_tracer(message, event_tx).await {
+        let mut tracer = match self.get_task_tracer(message).await {
             Ok(tracer) => tracer,
             Err(e) => {
                 // Even though the message meta data was okay, we failed to deserialize
@@ -486,12 +483,8 @@ impl Celery {
     }
 
     /// Wraps `try_handle_delivery` to catch any and all errors that might occur.
-    async fn handle_delivery(
-        self: Arc<Self>,
-        delivery: Box<dyn Delivery>,
-        event_tx: UnboundedSender<TaskEvent>,
-    ) {
-        if let Err(e) = self.try_handle_delivery(delivery, event_tx).await {
+    async fn handle_delivery(self: Arc<Self>, delivery: Box<dyn Delivery>) {
+        if let Err(e) = self.try_handle_delivery(delivery).await {
             error!("{}", e);
         }
     }
@@ -509,8 +502,19 @@ impl Celery {
 
     /// Consume tasks from any number of queues.
     pub async fn consume_from(self: &Arc<Self>, queues: &[&str]) -> Result<(), CeleryError> {
+        self.consume_with_signals(queues, &mut Ender::new()?).await
+    }
+
+    async fn consume_with_signals(
+        self: &Arc<Self>,
+        queues: &[&str],
+        ender: &mut impl SignalSource,
+    ) -> Result<(), CeleryError> {
+        // Delivery handlers outlive an individual broker connection. Own them until their
+        // business work and acknowledgement/retry finish, including recovery and shutdown.
+        let mut tasks = DeliveryTasks::new();
         loop {
-            let result = self.clone()._consume_from(queues).await;
+            let result = self.clone()._consume_from(queues, &mut tasks, ender).await;
             if !self.broker_connection_retry {
                 return result;
             }
@@ -533,12 +537,23 @@ impl Celery {
             let mut reconnect_successful: bool = false;
             for _ in 0..self.broker_connection_max_retries {
                 info!("Trying to re-establish connection with broker");
-                time::sleep(Duration::from_secs(
-                    self.broker_connection_retry_delay as u64,
-                ))
-                .await;
+                let reconnect = async {
+                    time::sleep(Duration::from_secs(
+                        self.broker_connection_retry_delay as u64,
+                    ))
+                    .await;
+                    self.broker.reconnect(self.broker_connection_timeout).await
+                };
+                let reconnected = select! {
+                    biased;
+                    _ = ender.wait() => {
+                        info!("Warm shutdown during broker recovery...");
+                        return tasks.drain(ender).await;
+                    }
+                    result = reconnect => result,
+                };
 
-                match self.broker.reconnect(self.broker_connection_timeout).await {
+                match reconnected {
                     Err(err) => {
                         if err.is_connection_error() {
                             continue;
@@ -560,7 +575,12 @@ impl Celery {
     }
 
     #[allow(clippy::cognitive_complexity)]
-    async fn _consume_from(self: Arc<Self>, queues: &[&str]) -> Result<(), CeleryError> {
+    async fn _consume_from(
+        self: Arc<Self>,
+        queues: &[&str],
+        tasks: &mut DeliveryTasks,
+        ender: &mut impl SignalSource,
+    ) -> Result<(), CeleryError> {
         if queues.is_empty() {
             return Err(CeleryError::NoQueueToConsume);
         }
@@ -590,30 +610,20 @@ impl Celery {
             consumer_tags.push(consumer_tag);
         }
 
-        // Stream of OS signals.
-        let mut ender = Ender::new()?;
-
-        // A sender and receiver for task related events.
-        // NOTE: we can use an unbounded channel since we already have backpressure
-        // from the `prefetch_count` setting.
-        let (task_event_tx, mut task_event_rx) = mpsc::unbounded_channel::<TaskEvent>();
-        let mut pending_tasks = 0;
-
         // This is the main loop where we receive deliveries and pass them off
         // to be handled by spawning `self.handle_delivery`.
         // At the same time we are also listening for a SIGINT (Ctrl+C) or SIGTERM interruption.
         // If that occurs we break from this loop and move to the warm shutdown loop
-        // if there are still any pending tasks (tasks being executed, not including
-        // tasks being delayed due to a future ETA).
+        // if there are still delivery handlers, including acquired tasks waiting for ETA
+        // and tasks publishing their retry or final acknowledgement.
         loop {
             select! {
                 maybe_delivery_result = stream_map.next() => {
                     if let Some((queue, delivery_result)) = maybe_delivery_result {
                         match delivery_result {
                             Ok(delivery) => {
-                                let task_event_tx = task_event_tx.clone();
                                 debug!("Received delivery from {}: {:?}", queue, delivery);
-                                tokio::spawn(self.clone().handle_delivery(delivery, task_event_tx));
+                                tasks.handles.spawn(self.clone().handle_delivery(delivery));
                             }
                             Err(e) => {
                                 error!("Deliver failed: {}", e);
@@ -628,14 +638,8 @@ impl Celery {
                     info!("Warm shutdown...");
                     break;
                 },
-                maybe_task_event = task_event_rx.recv() => {
-                    if let Some(event) = maybe_task_event {
-                        debug!("Received task event {:?}", event);
-                        match event {
-                            TaskEvent::StatusChange(TaskStatus::Pending) => pending_tasks += 1,
-                            TaskEvent::StatusChange(TaskStatus::Finished) => pending_tasks -= 1,
-                        };
-                    }
+                finished = tasks.handles.join_next(), if !tasks.handles.is_empty() => {
+                    DeliveryTasks::record_completion(finished);
                 },
                 maybe_broker_error = broker_error_rx.recv() => {
                     if let Some(broker_error) = maybe_broker_error {
@@ -652,39 +656,53 @@ impl Celery {
             self.broker.cancel(&consumer_tag).await?;
         }
 
-        if pending_tasks > 0 {
-            // Warm shutdown loop. When there are still pending tasks we wait for them
-            // to finish. We get updates about pending tasks through the `task_event_rx` channel.
-            // We also watch for a second SIGINT or SIGTERM, in which case we immediately shutdown.
-            info!("Waiting on {} pending tasks...", pending_tasks);
-            loop {
-                select! {
-                    ending = ender.wait() => {
-                        if let Ok(SigType::Interrupt) = ending {
-                            warn!("Okay fine, shutting down now. See ya!");
-                            return Err(CeleryError::ForcedShutdown);
-                        }
-                    },
-                    maybe_event = task_event_rx.recv() => {
-                        if let Some(event) = maybe_event {
-                            debug!("Received task event {:?}", event);
-                            match event {
-                                TaskEvent::StatusChange(TaskStatus::Pending) => pending_tasks += 1,
-                                TaskEvent::StatusChange(TaskStatus::Finished) => pending_tasks -= 1,
-                            };
-                            if pending_tasks <= 0 {
-                                break;
-                            }
-                        }
-                    },
-                };
-            }
-        }
+        tasks.drain(ender).await?;
 
         info!("No more pending tasks. See ya!");
 
         Ok(())
     }
+}
+
+struct DeliveryTasks {
+    handles: tokio::task::JoinSet<()>,
+}
+
+impl DeliveryTasks {
+    fn new() -> Self {
+        Self {
+            handles: tokio::task::JoinSet::new(),
+        }
+    }
+
+    fn record_completion(result: Option<Result<(), tokio::task::JoinError>>) {
+        if let Some(Err(error)) = result {
+            error!("Delivery handler failed: {}", error);
+        }
+    }
+
+    async fn drain(&mut self, ender: &mut impl SignalSource) -> Result<(), CeleryError> {
+        if !self.handles.is_empty() {
+            info!("Waiting on {} delivery handlers...", self.handles.len());
+        }
+        while !self.handles.is_empty() {
+            select! {
+                ending = ender.wait() => {
+                    if let Ok(SigType::Interrupt) = ending {
+                        warn!("Okay fine, shutting down now. See ya!");
+                        return Err(CeleryError::ForcedShutdown);
+                    }
+                }
+                finished = self.handles.join_next() => Self::record_completion(finished),
+            }
+        }
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+trait SignalSource: Send {
+    async fn wait(&mut self) -> Result<SigType, std::io::Error>;
 }
 
 #[allow(unused)]
@@ -710,7 +728,11 @@ impl Ender {
 
         Ok(Ender { sigint, sigterm })
     }
+}
 
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl SignalSource for Ender {
     /// Waits for either an interrupt or terminate.
     async fn wait(&mut self) -> Result<SigType, std::io::Error> {
         let sigtype;
@@ -736,7 +758,11 @@ impl Ender {
     fn new() -> Result<Self, std::io::Error> {
         Ok(Ender)
     }
+}
 
+#[cfg(windows)]
+#[async_trait::async_trait]
+impl SignalSource for Ender {
     async fn wait(&mut self) -> Result<SigType, std::io::Error> {
         tokio::signal::ctrl_c().await?;
 

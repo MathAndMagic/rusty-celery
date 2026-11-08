@@ -185,3 +185,7 @@ And then you can consume tasks from Rust or Python as explained above.
 - Temporary claim/send/retry result keys expire after five minutes; they deduplicate transport retries, not separate calls to send a business task.
 - The existing process map requires unique concurrent task IDs; concurrently delivering identical payloads with the same correlation ID does not create independent pending records.
 - Delivery drop releases only local prefetch capacity; it does not delete durable pending records.
+- Redis connection drivers are owned by the runtime and aborted on timeout, cancellation, or endpoint replacement.
+- `Celery::consume_from` owns delivery handlers across consumer reconnects and waits through business execution, retry publication, and acknowledgement during warm shutdown.
+- Acquired deliveries waiting for a future ETA also remain owned during warm shutdown; callers that require a shutdown deadline must bound the consumer future.
+- SIGTERM or SIGINT interrupts reconnect backoff before draining active delivery handlers.
