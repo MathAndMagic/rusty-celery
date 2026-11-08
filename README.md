@@ -168,3 +168,20 @@ And then you can consume tasks from Rust or Python as explained above.
 | ----------- |:------:| -------- |
 | RPC         | 🔴     | [![](https://img.shields.io/github/issues/rusty-celery/rusty-celery/Backend%3A%20RPC?label=Issues)](https://github.com/rusty-celery/rusty-celery/labels/Backend%3A%20RPC) |
 | Redis       | 🔴     | [![](https://img.shields.io/github/issues/rusty-celery/rusty-celery/Backend%3A%20Redis?label=Issues)](https://github.com/rusty-celery/rusty-celery/labels/Backend%3A%20Redis) |
+
+### Redis recovery contract
+
+- `RedisBrokerBuilder::with_runtime` shares `RedisBrokerRuntime` across endpoint replacements, so existing consumers and outstanding deliveries retain the same capacity ownership.
+- A Redis connection acquisition or command has a five-second deadline; connection installation and explicit reconnect honor the supplied timeout, including lock acquisition.
+- Replay-safe claim, send, acknowledgement, and retry commands make at most two attempts; their total transport budget is at most twenty seconds.
+- `Broker::health_snapshot` reads local consumer progress synchronously; each consumer must poll within thirty seconds, unless owned deliveries fill prefetch capacity.
+- Idle queues poll every second, and readiness probes cannot refresh consumer progress.
+- `Broker::health_check` checks the role of the actual broker connection and rejects replicas; producer-only brokers do not require a consumer heartbeat.
+- Queue messages retain the existing Celery JSON format and Redis list names; outstanding messages retain `_celery.<queue>_process_map`, keyed by correlation ID.
+- Claim atomically records the payload in the process map before removing it from the queue; a stable claim ID reconciles a lost reply within the bounded retry budget.
+- A cancelled claim or process crash can leave a durable process-map record; this transport does not reclaim those records or promise automatic restart redelivery.
+- Acknowledgement compares the original payload before deletion, so an old attempt cannot delete a different retried payload with the same task ID.
+- Task retry atomically enqueues the next attempt and removes the matching pending record; it also supports tasks acknowledged before execution.
+- Temporary claim/send/retry result keys expire after five minutes; they deduplicate transport retries, not separate calls to send a business task.
+- The existing process map requires unique concurrent task IDs; concurrently delivering identical payloads with the same correlation ID does not create independent pending records.
+- Delivery drop releases only local prefetch capacity; it does not delete durable pending records.

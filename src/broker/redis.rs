@@ -108,9 +108,11 @@ pub struct RedisBrokerRuntime {
     generation: AtomicU64,
     closed: AtomicBool,
     prefetch: AtomicUsize,
+    unlimited: bool,
     occupied: AtomicUsize,
     in_flight: AtomicUsize,
     consumers: Mutex<HashMap<String, Arc<ConsumerState>>>,
+    stopped: Mutex<HashMap<String, Instant>>,
     last_progress: Mutex<Option<Instant>>,
     wake: Notify,
 }
@@ -122,15 +124,35 @@ impl RedisBrokerRuntime {
             generation: AtomicU64::new(0),
             closed: AtomicBool::new(false),
             prefetch: AtomicUsize::new(prefetch as usize),
+            unlimited: prefetch == 0,
             occupied: AtomicUsize::new(0),
             in_flight: AtomicUsize::new(0),
             consumers: Mutex::new(HashMap::new()),
+            stopped: Mutex::new(HashMap::new()),
             last_progress: Mutex::new(None),
             wake: Notify::new(),
         }
     }
     fn progress(&self) {
         *self.last_progress.lock().unwrap() = Some(Instant::now());
+    }
+    /// Records a bounded recovery attempt owned by the consumer control loop.
+    /// Readiness checks, producers, and endpoint-notification listeners must not call this.
+    pub fn record_consumer_reconnect(&self) {
+        let consuming = {
+            let mut progress = self.last_progress.lock().unwrap();
+            if progress.is_some() {
+                *progress = Some(Instant::now());
+                true
+            } else {
+                false
+            }
+        };
+        if consuming {
+            for stopped in self.stopped.lock().unwrap().values_mut() {
+                *stopped = Instant::now();
+            }
+        }
     }
     pub fn health_snapshot(&self) -> BrokerHealth {
         let consumers = self.consumers.lock().unwrap();
@@ -140,6 +162,7 @@ impl RedisBrokerRuntime {
         let age = consumers
             .values()
             .map(|state| state.progress.lock().unwrap().elapsed())
+            .chain(self.stopped.lock().unwrap().values().map(Instant::elapsed))
             .max()
             .or_else(|| {
                 self.last_progress
@@ -479,6 +502,14 @@ impl Drop for Consumer {
             .lock()
             .unwrap()
             .remove(&self.tag);
+        if !self.state.cancelled.load(Ordering::SeqCst) {
+            self.channel
+                .runtime
+                .stopped
+                .lock()
+                .unwrap()
+                .insert(self.channel.queue.clone(), Instant::now());
+        }
         self.channel.runtime.progress();
     }
 }
@@ -504,6 +535,7 @@ impl Broker for RedisBroker {
         queue: &str,
         error_handler: Box<dyn Fn(BrokerError) + Send + Sync + 'static>,
     ) -> Result<(String, Box<dyn DeliveryStream>), BrokerError> {
+        self.runtime.stopped.lock().unwrap().remove(queue);
         let tag = Uuid::new_v4().to_string();
         let state = Arc::new(ConsumerState {
             cancelled: AtomicBool::new(false),
@@ -555,11 +587,17 @@ impl Broker for RedisBroker {
         .await
     }
     async fn increase_prefetch_count(&self) -> Result<(), BrokerError> {
+        if self.runtime.unlimited {
+            return Ok(());
+        }
         self.runtime.prefetch.fetch_add(1, Ordering::SeqCst);
         self.runtime.wake.notify_waiters();
         Ok(())
     }
     async fn decrease_prefetch_count(&self) -> Result<(), BrokerError> {
+        if self.runtime.unlimited {
+            return Ok(());
+        }
         self.runtime
             .prefetch
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
@@ -581,7 +619,7 @@ impl Broker for RedisBroker {
         "redis://[managed-connection]".into()
     }
     async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError> {
-        self.runtime.progress();
+        self.runtime.record_consumer_reconnect();
         let client = self
             .runtime
             .transport
@@ -603,3 +641,6 @@ impl Broker for RedisBroker {
         self
     }
 }
+
+#[cfg(test)]
+mod tests;
