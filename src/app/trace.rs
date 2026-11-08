@@ -1,33 +1,30 @@
 use async_trait::async_trait;
 use log::{debug, error, info, warn};
 use std::sync::Arc;
-use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::{self, Duration, Instant};
 
 use crate::error::{ProtocolError, TaskError, TraceError};
 use crate::protocol::Message;
-use crate::task::{Request, Task, TaskEvent, TaskOptions, TaskStatus};
+use crate::task::{Request, Task, TaskOptions};
 use crate::Celery;
 
 /// A `Tracer` provides the API through which a `Celery` application interacts with its tasks.
 ///
 /// A `Tracer` is tied to a task and is responsible for executing it directly, catching
 /// and handling any errors, logging, and running the `on_failure` or `on_success` post-execution
-/// methods. It communicates its progress and the results back to the application through
-/// the `event_tx` channel and the return value of `Tracer::trace`, respectively.
+/// methods. It returns task execution results to the application's owned delivery handler.
 pub(super) struct Tracer<T>
 where
     T: Task,
 {
     task: T,
-    event_tx: UnboundedSender<TaskEvent>,
 }
 
 impl<T> Tracer<T>
 where
     T: Task,
 {
-    fn new(task: T, event_tx: UnboundedSender<TaskEvent>) -> Self {
+    fn new(task: T) -> Self {
         if let Some(eta) = task.request().eta {
             info!(
                 "Task {}[{}] received, ETA: {}",
@@ -39,7 +36,7 @@ where
             info!("Task {}[{}] received", task.name(), task.request().id);
         }
 
-        Self { task, event_tx }
+        Self { task }
     }
 }
 
@@ -57,14 +54,6 @@ where
             );
             return Err(TraceError::ExpirationError);
         }
-
-        self.event_tx
-            .send(TaskEvent::StatusChange(TaskStatus::Pending))
-            .unwrap_or_else(|_| {
-                // This really shouldn't happen. If it does, there's probably much
-                // bigger things to worry about like running out of memory.
-                error!("Failed sending task event");
-            });
 
         let start = Instant::now();
         let result = match self.task.time_limit() {
@@ -91,12 +80,6 @@ where
 
                 // Run success callback.
                 self.task.on_success(&returned).await;
-
-                self.event_tx
-                    .send(TaskEvent::StatusChange(TaskStatus::Finished))
-                    .unwrap_or_else(|_| {
-                        error!("Failed sending task event");
-                    });
 
                 Ok(())
             }
@@ -141,12 +124,6 @@ where
 
                 // Run failure callback.
                 self.task.on_failure(&e).await;
-
-                self.event_tx
-                    .send(TaskEvent::StatusChange(TaskStatus::Finished))
-                    .unwrap_or_else(|_| {
-                        error!("Failed sending task event");
-                    });
 
                 if !should_retry {
                     return Err(TraceError::TaskError(e));
@@ -223,23 +200,13 @@ pub(super) trait TracerTrait: Send + Sync {
 pub(super) type TraceBuilderResult = Result<Box<dyn TracerTrait>, ProtocolError>;
 
 pub(super) type TraceBuilder = Box<
-    dyn Fn(
-            Arc<Celery>,
-            Message,
-            TaskOptions,
-            UnboundedSender<TaskEvent>,
-            String,
-        ) -> TraceBuilderResult
-        + Send
-        + Sync
-        + 'static,
+    dyn Fn(Arc<Celery>, Message, TaskOptions, String) -> TraceBuilderResult + Send + Sync + 'static,
 >;
 
 pub(super) fn build_tracer<T: Task + Send + 'static>(
     app: Arc<Celery>,
     message: Message,
     mut options: TaskOptions,
-    event_tx: UnboundedSender<TaskEvent>,
     hostname: String,
 ) -> TraceBuilderResult {
     // Build request object.
@@ -255,5 +222,5 @@ pub(super) fn build_tracer<T: Task + Send + 'static>(
     // it.
     let task = T::from_request(request, options);
 
-    Ok(Box::new(Tracer::<T>::new(task, event_tx)))
+    Ok(Box::new(Tracer::<T>::new(task)))
 }

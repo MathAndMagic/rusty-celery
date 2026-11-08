@@ -209,17 +209,6 @@ pub trait Task: Send + Sync + std::marker::Sized {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) enum TaskEvent {
-    StatusChange(TaskStatus),
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum TaskStatus {
-    Pending,
-    Finished,
-}
-
 /// Extension methods for `Result` types within a task body.
 ///
 /// These methods can be used to convert a `Result<T, E>` to a `Result<T, TaskError>` with the
