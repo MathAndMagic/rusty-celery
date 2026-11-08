@@ -7,7 +7,7 @@ use crate::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures::{Future, Stream};
-use redis::{aio::ConnectionManager, Client, FromRedisValue};
+use redis::{aio::MultiplexedConnection, Client, FromRedisValue};
 use std::{
     collections::HashMap,
     fmt, io,
@@ -94,9 +94,51 @@ impl ConsumerState {
     }
 }
 
+struct ManagedConnection {
+    connection: MultiplexedConnection,
+    driver: tokio::task::JoinHandle<()>,
+}
+impl ManagedConnection {
+    async fn connect(client: &Client, deadline: Duration) -> Result<Self, BrokerError> {
+        let (connection, driver) = bounded(
+            "connect",
+            deadline,
+            client.create_multiplexed_tokio_connection(),
+        )
+        .await?;
+        Ok(Self {
+            connection,
+            driver: tokio::spawn(driver),
+        })
+    }
+}
+impl Drop for ManagedConnection {
+    fn drop(&mut self) {
+        // redis 0.22's detached default driver waits for outstanding replies on drop.
+        // Explicit ownership closes a blackholed socket when its deadline expires.
+        self.driver.abort();
+    }
+}
+struct CommandGuard<'a> {
+    runtime: &'a RedisBrokerRuntime,
+    generation: u64,
+    completed: bool,
+}
+impl Drop for CommandGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let mut current = self.runtime.transport.write().unwrap();
+            if let Some(current) = current.as_mut() {
+                if current.generation == self.generation {
+                    current.manager = None;
+                }
+            }
+        }
+    }
+}
 struct Transport {
     client: Client,
-    manager: Option<ConnectionManager>,
+    manager: Option<ManagedConnection>,
     generation: u64,
 }
 
@@ -202,8 +244,7 @@ impl RedisBrokerRuntime {
                 manager: None,
                 generation,
             });
-            let manager =
-                bounded("connect", deadline, client.get_tokio_connection_manager()).await?;
+            let manager = ManagedConnection::connect(&client, deadline).await?;
             self.transport.write().unwrap().as_mut().unwrap().manager = Some(manager);
             self.closed.store(false, Ordering::SeqCst);
             self.wake.notify_waiters();
@@ -212,43 +253,41 @@ impl RedisBrokerRuntime {
         .await
         .map_err(|_| io_error("Redis connection replacement timed out"))?
     }
-    async fn connection(&self) -> Result<(ConnectionManager, u64), BrokerError> {
+    async fn connection(&self) -> Result<(MultiplexedConnection, u64), BrokerError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(BrokerError::NotConnected);
         }
         tokio::time::timeout(COMMAND_TIMEOUT, async {
             let _lock = self.connect_lock.lock().await;
-            let (client, generation) = {
+            let client = {
                 let current = self.transport.read().unwrap();
                 let current = current.as_ref().ok_or(BrokerError::NotConnected)?;
                 if let Some(manager) = &current.manager {
-                    return Ok((manager.clone(), current.generation));
+                    return Ok((manager.connection.clone(), current.generation));
                 }
-                (current.client.clone(), current.generation)
+                current.client.clone()
             };
-            let manager = bounded(
-                "connect",
-                COMMAND_TIMEOUT,
-                client.get_tokio_connection_manager(),
-            )
-            .await?;
-            self.transport.write().unwrap().as_mut().unwrap().manager = Some(manager.clone());
-            Ok((manager, generation))
+            let manager = ManagedConnection::connect(&client, COMMAND_TIMEOUT).await?;
+            let connection = manager.connection.clone();
+            let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            let mut current = self.transport.write().unwrap();
+            let current = current.as_mut().unwrap();
+            current.generation = generation;
+            current.manager = Some(manager);
+            Ok((connection, generation))
         })
         .await
         .map_err(|_| io_error("Redis connection acquisition timed out"))?
     }
     async fn command<T: FromRedisValue>(&self, cmd: &redis::Cmd) -> Result<T, BrokerError> {
         let (mut connection, generation) = self.connection().await?;
+        let mut guard = CommandGuard {
+            runtime: self,
+            generation,
+            completed: false,
+        };
         let result = bounded("command", COMMAND_TIMEOUT, cmd.query_async(&mut connection)).await;
-        if result.is_err() {
-            let mut current = self.transport.write().unwrap();
-            if let Some(current) = current.as_mut() {
-                if current.generation == generation {
-                    current.manager = None;
-                }
-            }
-        }
+        guard.completed = result.is_ok();
         result
     }
     // Only replay operations whose Lua script reconciles a lost reply using stable ownership.

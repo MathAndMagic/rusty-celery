@@ -305,6 +305,13 @@ async fn cancelled_ambiguous_claim_retains_durable_pending_record() {
     proxy.armed.store(true, Ordering::SeqCst);
     tokio::select! { _ = stream.next() => panic!("reply should be held"), _ = proxy.executed.notified() => {} }
     drop(stream); // Cancels claim future before reply is observed.
+                  // The cancelled request closes its owned driver; a fresh transport can answer immediately.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), broker.health_check())
+            .await
+            .unwrap()
+            .is_ok()
+    );
     assert_eq!(runtime.health_snapshot().in_flight_deliveries, 0);
     assert_eq!(runtime.occupied.load(Ordering::SeqCst), 0);
     let direct_runtime = Arc::new(RedisBrokerRuntime::new(1));
@@ -473,4 +480,55 @@ async fn producer_reconnection_never_creates_a_consumer_heartbeat_requirement() 
     assert!(health.is_live);
     assert_eq!(health.active_consumers, 0);
     assert_eq!(health.last_consumer_progress_age, None);
+}
+
+#[tokio::test]
+async fn timed_out_rpc_closes_the_owned_connection_driver() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("redis://{}/0", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 512];
+        assert!(socket.read(&mut request).await.unwrap() > 0);
+        // Deliberately keep the TCP connection open without replying to ROLE.
+        // Deadline cancellation must close the socket, not leave a detached driver waiting.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(7), socket.read(&mut request))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    });
+    let broker = RedisBrokerBuilder::new(&url).build(1).await.unwrap();
+    assert!(broker
+        .health_check()
+        .await
+        .unwrap_err()
+        .is_connection_error());
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn old_concurrent_cancellation_cannot_close_replacement_driver() {
+    let (runtime, _, _) = setup().await;
+    let (_, generation) = runtime.connection().await.unwrap();
+    let first = CommandGuard {
+        runtime: &runtime,
+        generation,
+        completed: false,
+    };
+    let delayed = CommandGuard {
+        runtime: &runtime,
+        generation,
+        completed: false,
+    };
+    drop(first); // One failed request invalidates their shared original transport.
+    let (mut replacement, _) = runtime.connection().await.unwrap();
+    drop(delayed); // Another original request observes cancellation after replacement.
+    let response: String = redis::cmd("PING")
+        .query_async(&mut replacement)
+        .await
+        .unwrap();
+    assert_eq!(response, "PONG");
 }
