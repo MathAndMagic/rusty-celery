@@ -114,6 +114,7 @@ pub struct RedisBrokerRuntime {
     consumers: Mutex<HashMap<String, Arc<ConsumerState>>>,
     stopped: Mutex<HashMap<String, Instant>>,
     last_progress: Mutex<Option<Instant>>,
+    capacity_released: Mutex<Option<Instant>>,
     wake: Notify,
 }
 impl RedisBrokerRuntime {
@@ -130,6 +131,7 @@ impl RedisBrokerRuntime {
             consumers: Mutex::new(HashMap::new()),
             stopped: Mutex::new(HashMap::new()),
             last_progress: Mutex::new(None),
+            capacity_released: Mutex::new(None),
             wake: Notify::new(),
         }
     }
@@ -171,17 +173,27 @@ impl RedisBrokerRuntime {
                     .map(|time| time.elapsed())
             });
         BrokerHealth {
-            is_live: age.map_or(true, |age| age < CONSUMER_PROGRESS_TIMEOUT)
-                || (active > 0 && limit > 0 && in_flight >= limit),
+            is_live: !matches!(age, Some(age) if age >= CONSUMER_PROGRESS_TIMEOUT)
+                || (active > 0 && limit > 0 && in_flight >= limit)
+                || matches!(*self.capacity_released.lock().unwrap(), Some(time) if time.elapsed() < CONSUMER_PROGRESS_TIMEOUT),
             active_consumers: active,
             in_flight_deliveries: in_flight,
             prefetch_limit: limit,
             last_consumer_progress_age: age,
         }
     }
-    async fn install(&self, client: Client, deadline: Duration) -> Result<(), BrokerError> {
+    async fn install(&self, client: Option<Client>, deadline: Duration) -> Result<(), BrokerError> {
         tokio::time::timeout(deadline, async {
             let _lock = self.connect_lock.lock().await;
+            let client = client
+                .or_else(|| {
+                    self.transport
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .map(|current| current.client.clone())
+                })
+                .ok_or(BrokerError::NotConnected)?;
             // Publish the desired endpoint before connecting: an old failed request must never
             // install its stale endpoint over a newly discovered Sentinel primary.
             let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -291,7 +303,13 @@ impl Drop for Slot {
     fn drop(&mut self) {
         self.runtime.occupied.fetch_sub(1, Ordering::SeqCst);
         if self.delivered {
-            self.runtime.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let previous = self.runtime.in_flight.fetch_sub(1, Ordering::SeqCst);
+            let limit = self.runtime.prefetch.load(Ordering::SeqCst);
+            if limit > 0 && previous == limit {
+                // A legitimately capacity-blocked consumer gets a fresh polling deadline
+                // when work releases its slot, even after a very long task.
+                *self.runtime.capacity_released.lock().unwrap() = Some(Instant::now());
+            }
         }
         self.runtime.wake.notify_waiters();
     }
@@ -336,7 +354,7 @@ impl BrokerBuilder for RedisBrokerBuilder {
             .unwrap_or_else(|| Arc::new(RedisBrokerRuntime::new(self.prefetch)));
         runtime
             .install(
-                client,
+                Some(client),
                 Duration::from_secs(connection_timeout.max(1) as u64),
             )
             .await?;
@@ -620,20 +638,8 @@ impl Broker for RedisBroker {
     }
     async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError> {
         self.runtime.record_consumer_reconnect();
-        let client = self
-            .runtime
-            .transport
-            .read()
-            .unwrap()
-            .as_ref()
-            .ok_or(BrokerError::NotConnected)?
-            .client
-            .clone();
         self.runtime
-            .install(
-                client,
-                Duration::from_secs(connection_timeout.max(1) as u64),
-            )
+            .install(None, Duration::from_secs(connection_timeout.max(1) as u64))
             .await
     }
     #[cfg(test)]

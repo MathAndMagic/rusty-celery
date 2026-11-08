@@ -152,6 +152,8 @@ async fn health_uses_oldest_consumer_and_owned_capacity_not_readiness() {
     }
     assert!(broker.health_snapshot().is_live); // Real owned work fills prefetch; no task-duration limit.
     broker.ack(delivery.as_ref()).await.unwrap();
+    assert!(broker.health_snapshot().is_live); // Capacity release starts a fresh polling deadline.
+    *runtime.capacity_released.lock().unwrap() = Some(stale);
     assert!(!broker.health_snapshot().is_live);
     // A real idle poll refreshes its own progress even when no tasks arrive.
     assert!(
@@ -389,4 +391,86 @@ async fn unlimited_prefetch_remains_unlimited_for_delayed_tasks() {
     broker.increase_prefetch_count().await.unwrap();
     broker.decrease_prefetch_count().await.unwrap();
     assert_eq!(broker.health_snapshot().prefetch_limit, 0);
+}
+
+#[tokio::test]
+async fn command_timeout_recovers_transport_without_poisoning_local_liveness() {
+    let (runtime, broker, queue) = setup().await;
+    let start = Instant::now();
+    let result: Result<Option<(String, String)>, _> = runtime
+        .command(redis::cmd("BLPOP").arg(&queue).arg(0))
+        .await;
+    assert!(result.unwrap_err().is_connection_error());
+    assert!(start.elapsed() < Duration::from_secs(7));
+    assert!(broker.health_snapshot().is_live);
+    assert!(broker.health_check().await.unwrap().is_live);
+}
+
+#[tokio::test]
+async fn readiness_checks_actual_connection_role_without_killing_producer_liveness() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("redis://{}/0", listener.local_addr().unwrap());
+    let replica = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0; 512];
+        let n = socket.read(&mut request).await.unwrap();
+        assert!(request[..n].windows(4).any(|part| part == b"ROLE"));
+        socket.write_all(b"*1\r\n$5\r\nslave\r\n").await.unwrap();
+    });
+    let broker = RedisBrokerBuilder::new(&url).build(1).await.unwrap();
+    assert!(broker.health_check().await.is_err());
+    assert!(broker.health_snapshot().is_live);
+    replica.await.unwrap();
+}
+
+#[tokio::test]
+async fn malformed_claim_and_wrong_pending_type_leave_original_queue_message() {
+    let (runtime, _, queue) = setup().await;
+    let state = Arc::new(ConsumerState {
+        cancelled: AtomicBool::new(false),
+        progress: Mutex::new(Instant::now()),
+    });
+    let channel = Channel {
+        runtime: runtime.clone(),
+        queue: queue.clone(),
+    };
+    runtime
+        .command::<i64>(redis::cmd("LPUSH").arg(&queue).arg("123"))
+        .await
+        .unwrap();
+    assert!(channel.clone().fetch(state.clone()).await.is_err());
+    assert_eq!(count(&runtime, "LLEN", &queue).await, 1);
+    runtime
+        .command::<String>(
+            redis::cmd("LSET").arg(&queue).arg(0).arg(
+                message("blocked")
+                    .json_serialized(Some(DeliveryInfo::for_redis_default()))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    runtime
+        .command::<String>(
+            redis::cmd("SET")
+                .arg(channel.process_map())
+                .arg("wrong-type"),
+        )
+        .await
+        .unwrap();
+    assert!(channel.fetch(state).await.is_err());
+    assert_eq!(count(&runtime, "LLEN", &queue).await, 1);
+    assert_eq!(runtime.occupied.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn producer_reconnection_never_creates_a_consumer_heartbeat_requirement() {
+    let (runtime, broker, _) = setup().await;
+    broker.reconnect(1).await.unwrap();
+    runtime.record_consumer_reconnect();
+    assert!(runtime.last_progress.lock().unwrap().is_none());
+    let health = broker.health_check().await.unwrap();
+    assert!(health.is_live);
+    assert_eq!(health.active_consumers, 0);
+    assert_eq!(health.last_consumer_progress_age, None);
 }
