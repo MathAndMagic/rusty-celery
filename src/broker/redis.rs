@@ -87,10 +87,12 @@ async fn bounded<T>(
 struct ConsumerState {
     cancelled: AtomicBool,
     progress: Mutex<Instant>,
+    resume_grace: Mutex<Option<Instant>>,
 }
 impl ConsumerState {
     fn progress(&self) {
         *self.progress.lock().unwrap() = Instant::now();
+        *self.resume_grace.lock().unwrap() = None;
     }
 }
 
@@ -156,7 +158,6 @@ pub struct RedisBrokerRuntime {
     consumers: Mutex<HashMap<String, Arc<ConsumerState>>>,
     stopped: Mutex<HashMap<String, Instant>>,
     last_progress: Mutex<Option<Instant>>,
-    capacity_released: Mutex<Option<Instant>>,
     wake: Notify,
 }
 impl RedisBrokerRuntime {
@@ -173,7 +174,6 @@ impl RedisBrokerRuntime {
             consumers: Mutex::new(HashMap::new()),
             stopped: Mutex::new(HashMap::new()),
             last_progress: Mutex::new(None),
-            capacity_released: Mutex::new(None),
             wake: Notify::new(),
         }
     }
@@ -200,13 +200,15 @@ impl RedisBrokerRuntime {
     }
     pub fn health_snapshot(&self) -> BrokerHealth {
         let consumers = self.consumers.lock().unwrap();
+        let stopped = self.stopped.lock().unwrap();
         let active = consumers.len();
         let in_flight = self.in_flight.load(Ordering::SeqCst);
         let limit = self.prefetch.load(Ordering::SeqCst);
+        let full = limit > 0 && in_flight >= limit;
         let age = consumers
             .values()
             .map(|state| state.progress.lock().unwrap().elapsed())
-            .chain(self.stopped.lock().unwrap().values().map(Instant::elapsed))
+            .chain(stopped.values().map(Instant::elapsed))
             .max()
             .or_else(|| {
                 self.last_progress
@@ -214,10 +216,18 @@ impl RedisBrokerRuntime {
                     .unwrap()
                     .map(|time| time.elapsed())
             });
+        let consumers_live = consumers.values().all(|state| {
+            state.progress.lock().unwrap().elapsed() < CONSUMER_PROGRESS_TIMEOUT || full
+                || matches!(*state.resume_grace.lock().unwrap(), Some(time) if time.elapsed() < CONSUMER_PROGRESS_TIMEOUT)
+        });
+        // Another queue's owned work must never hide a disappeared consumer.
+        let stopped_live = stopped
+            .values()
+            .all(|time| time.elapsed() < CONSUMER_PROGRESS_TIMEOUT);
+        let control_live =
+            active > 0 || !matches!(age, Some(age) if age >= CONSUMER_PROGRESS_TIMEOUT);
         BrokerHealth {
-            is_live: !matches!(age, Some(age) if age >= CONSUMER_PROGRESS_TIMEOUT)
-                || (active > 0 && limit > 0 && in_flight >= limit)
-                || matches!(*self.capacity_released.lock().unwrap(), Some(time) if time.elapsed() < CONSUMER_PROGRESS_TIMEOUT),
+            is_live: consumers_live && stopped_live && control_live,
             active_consumers: active,
             in_flight_deliveries: in_flight,
             prefetch_limit: limit,
@@ -347,7 +357,14 @@ impl Drop for Slot {
             if limit > 0 && previous == limit {
                 // A legitimately capacity-blocked consumer gets a fresh polling deadline
                 // when work releases its slot, even after a very long task.
-                *self.runtime.capacity_released.lock().unwrap() = Some(Instant::now());
+                for state in self.runtime.consumers.lock().unwrap().values() {
+                    // Grant this consumer only one resume grace until it actually polls.
+                    state
+                        .resume_grace
+                        .lock()
+                        .unwrap()
+                        .get_or_insert_with(Instant::now);
+                }
             }
         }
         self.runtime.wake.notify_waiters();
@@ -597,6 +614,7 @@ impl Broker for RedisBroker {
         let state = Arc::new(ConsumerState {
             cancelled: AtomicBool::new(false),
             progress: Mutex::new(Instant::now()),
+            resume_grace: Mutex::new(None),
         });
         self.runtime
             .consumers
@@ -677,9 +695,13 @@ impl Broker for RedisBroker {
     }
     async fn reconnect(&self, connection_timeout: u32) -> Result<(), BrokerError> {
         self.runtime.record_consumer_reconnect();
-        self.runtime
-            .install(None, Duration::from_secs(connection_timeout.max(1) as u64))
-            .await
+        let deadline = Duration::from_secs(connection_timeout.max(1) as u64);
+        tokio::time::timeout(deadline, async {
+            self.runtime.install(None, deadline).await?;
+            self.health_check().await.map(|_| ())
+        })
+        .await
+        .map_err(|_| io_error("Redis reconnect deadline exceeded"))?
     }
     #[cfg(test)]
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> {

@@ -173,8 +173,10 @@ And then you can consume tasks from Rust or Python as explained above.
 
 - `RedisBrokerBuilder::with_runtime` shares `RedisBrokerRuntime` across endpoint replacements, so existing consumers and outstanding deliveries retain the same capacity ownership.
 - A Redis connection acquisition or command has a five-second deadline; connection installation and explicit reconnect honor the supplied timeout, including lock acquisition.
+- Explicit reconnect requires the actual connection to report the primary role within the supplied reconnect deadline.
 - Replay-safe claim, send, acknowledgement, and retry commands make at most two attempts; their total transport budget is at most twenty seconds.
-- `Broker::health_snapshot` reads local consumer progress synchronously; each consumer must poll within thirty seconds, unless owned deliveries fill prefetch capacity.
+- `Broker::health_snapshot` reads local consumer progress synchronously; each active consumer must poll within thirty seconds, unless owned deliveries fill prefetch capacity.
+- Missing queues remain unhealthy even while other queues fill capacity; each active consumer receives only one resume grace after capacity becomes available, until it polls again.
 - Idle queues poll every second, and readiness probes cannot refresh consumer progress.
 - `Broker::health_check` checks the role of the actual broker connection and rejects replicas; producer-only brokers do not require a consumer heartbeat.
 - Queue messages retain the existing Celery JSON format and Redis list names; outstanding messages retain `_celery.<queue>_process_map`, keyed by correlation ID.

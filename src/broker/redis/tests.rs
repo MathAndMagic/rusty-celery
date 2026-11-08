@@ -153,7 +153,9 @@ async fn health_uses_oldest_consumer_and_owned_capacity_not_readiness() {
     assert!(broker.health_snapshot().is_live); // Real owned work fills prefetch; no task-duration limit.
     broker.ack(delivery.as_ref()).await.unwrap();
     assert!(broker.health_snapshot().is_live); // Capacity release starts a fresh polling deadline.
-    *runtime.capacity_released.lock().unwrap() = Some(stale);
+    for state in runtime.consumers.lock().unwrap().values() {
+        *state.resume_grace.lock().unwrap() = Some(stale);
+    }
     assert!(!broker.health_snapshot().is_live);
     // A real idle poll refreshes its own progress even when no tasks arrive.
     assert!(
@@ -436,6 +438,7 @@ async fn malformed_claim_and_wrong_pending_type_leave_original_queue_message() {
     let state = Arc::new(ConsumerState {
         cancelled: AtomicBool::new(false),
         progress: Mutex::new(Instant::now()),
+        resume_grace: Mutex::new(None),
     });
     let channel = Channel {
         runtime: runtime.clone(),
@@ -531,4 +534,63 @@ async fn old_concurrent_cancellation_cannot_close_replacement_driver() {
         .await
         .unwrap();
     assert_eq!(response, "PONG");
+}
+
+#[tokio::test]
+async fn other_queue_completions_cannot_extend_a_stale_consumers_resume_grace() {
+    let (runtime, broker, queue) = setup().await;
+    let (stale_tag, stale_stream) = broker
+        .consume("stale-queue", Box::new(|_| {}))
+        .await
+        .unwrap();
+    let (_, mut active) = broker
+        .consume(&queue, Box::new(|e| panic!("{}", e)))
+        .await
+        .unwrap();
+    let stale = Instant::now() - CONSUMER_PROGRESS_TIMEOUT - Duration::from_secs(1);
+    let stale_state = runtime.consumers.lock().unwrap()[&stale_tag].clone();
+    *stale_state.progress.lock().unwrap() = stale;
+    *stale_state.resume_grace.lock().unwrap() = Some(stale);
+    for index in 0..3 {
+        broker
+            .send(&message(&format!("other-{index}")), &queue)
+            .await
+            .unwrap();
+        let delivery = next(&mut active).await;
+        assert!(broker.health_snapshot().is_live); // Owned work currently fills all capacity.
+        broker.ack(delivery.as_ref()).await.unwrap();
+        assert!(!broker.health_snapshot().is_live); // Other work cannot renew this queue's grace.
+    }
+    drop(stale_stream);
+    *runtime
+        .stopped
+        .lock()
+        .unwrap()
+        .get_mut("stale-queue")
+        .unwrap() = stale;
+    broker.send(&message("full"), &queue).await.unwrap();
+    let full = next(&mut active).await;
+    assert!(!broker.health_snapshot().is_live); // Full capacity cannot hide a missing queue.
+    broker.ack(full.as_ref()).await.unwrap();
+}
+
+#[tokio::test]
+async fn direct_reconnect_rejects_a_replica_instead_of_resetting_retry_budget() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("redis://{}/0", listener.local_addr().unwrap());
+    let replica = tokio::spawn(async move {
+        let (mut initial, _) = listener.accept().await.unwrap();
+        let mut request = [0; 512];
+        assert_eq!(initial.read(&mut request).await.unwrap(), 0); // Reconnect replaced initial socket.
+        let (mut replacement, _) = listener.accept().await.unwrap();
+        let n = replacement.read(&mut request).await.unwrap();
+        assert!(request[..n].windows(4).any(|part| part == b"ROLE"));
+        replacement
+            .write_all(b"*1\r\n$5\r\nslave\r\n")
+            .await
+            .unwrap();
+    });
+    let broker = RedisBrokerBuilder::new(&url).build(1).await.unwrap();
+    assert!(broker.reconnect(1).await.unwrap_err().is_connection_error());
+    replica.await.unwrap();
 }
