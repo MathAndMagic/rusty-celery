@@ -15,7 +15,7 @@ use crate::{
 
 mod amqp;
 mod redis;
-pub use self::redis::{RedisBroker, RedisBrokerBuilder};
+pub use self::redis::{RedisBroker, RedisBrokerBuilder, RedisBrokerRuntime};
 pub use amqp::{AMQPBroker, AMQPBrokerBuilder};
 
 #[cfg(test)]
@@ -44,9 +44,41 @@ pub trait DeliveryStream:
 {
 }
 
+/// Locally observed broker control-loop progress, independent of task execution duration.
+#[derive(Clone, Debug)]
+pub struct BrokerHealth {
+    pub is_live: bool,
+    pub active_consumers: usize,
+    pub in_flight_deliveries: usize,
+    pub prefetch_limit: usize,
+    pub last_consumer_progress_age: Option<std::time::Duration>,
+}
+
+impl Default for BrokerHealth {
+    fn default() -> Self {
+        Self {
+            is_live: true,
+            active_consumers: 0,
+            in_flight_deliveries: 0,
+            prefetch_limit: 0,
+            last_consumer_progress_age: None,
+        }
+    }
+}
+
 /// A message [`Broker`] is used as the transport for producing or consuming tasks.
 #[async_trait]
 pub trait Broker: Send + Sync {
+    /// Nonblocking liveness observation. A dependency outage alone is not a dead control loop.
+    fn health_snapshot(&self) -> BrokerHealth {
+        BrokerHealth::default()
+    }
+
+    /// Probe the broker transport without replacing local progress evidence.
+    async fn health_check(&self) -> Result<BrokerHealth, BrokerError> {
+        Ok(self.health_snapshot())
+    }
+
     /// Return a string representation of the broker URL with any sensitive information
     /// redacted.
     fn safe_url(&self) -> String;

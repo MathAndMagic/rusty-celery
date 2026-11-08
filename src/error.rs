@@ -173,7 +173,14 @@ impl BrokerError {
                     | lapin::Error::InvalidChannelState(_)
             ),
             BrokerError::RedisError(err) => {
-                err.is_connection_dropped() || err.is_connection_refusal()
+                err.is_connection_dropped()
+                    || err.is_connection_refusal()
+                    || matches!(
+                        err.kind(),
+                        redis::ErrorKind::ReadOnly
+                            | redis::ErrorKind::MasterDown
+                            | redis::ErrorKind::BusyLoadingError
+                    )
             }
             _ => false,
         }
